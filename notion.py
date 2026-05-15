@@ -5,6 +5,8 @@ import os
 import requests
 from dotenv import load_dotenv
 
+from network import request_with_retries
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -18,6 +20,12 @@ NOTION_BASE_URL = "https://api.notion.com/v1"
 _MAX_BLOCKS_PER_REQUEST = 100
 _REQUEST_TIMEOUT = 30
 _ARCHIVE_AFTER_DAYS = 30
+_SAFE_REQUEST_RETRIES = 2
+_CREATE_PAGE_MAX_ATTEMPTS = 3
+
+
+class NotionAPIError(RuntimeError):
+    """Raised when a critical Notion API operation fails."""
 
 
 def _get_headers() -> dict[str, str]:
@@ -29,34 +37,73 @@ def _get_headers() -> dict[str, str]:
     }
 
 
-def _query_database_with_pagination(
-    database_id: str, payload: dict
-) -> list[dict]:
+def _notion_request(
+    method: str,
+    path: str,
+    *,
+    max_retries: int,
+    operation_name: str,
+    **kwargs,
+) -> requests.Response:
+    """Execute a request against Notion API with standard headers and retry control."""
+    return request_with_retries(
+        method=method,
+        url=f"{NOTION_BASE_URL}{path}",
+        headers=_get_headers(),
+        timeout=_REQUEST_TIMEOUT,
+        max_retries=max_retries,
+        operation_name=operation_name,
+        **kwargs,
+    )
+
+
+def _query_database_with_pagination(database_id: str, payload: dict) -> list[dict]:
     """Query a Notion database handling pagination automatically."""
-    url = f"{NOTION_BASE_URL}/databases/{database_id}/query"
     all_results: list[dict] = []
     has_more = True
     start_cursor: str | None = None
 
     while has_more:
+        page_payload = payload.copy()
         if start_cursor:
-            payload["start_cursor"] = start_cursor
+            page_payload["start_cursor"] = start_cursor
 
         try:
-            response = requests.post(
-                url, headers=_get_headers(), json=payload, timeout=_REQUEST_TIMEOUT
+            response = _notion_request(
+                "POST",
+                f"/databases/{database_id}/query",
+                json=page_payload,
+                max_retries=_SAFE_REQUEST_RETRIES,
+                operation_name=f"query notion database {database_id}",
             )
-            response.raise_for_status()
-            data = response.json()
         except requests.exceptions.RequestException as err:
-            logger.error("Error querying database %s: %s", database_id, err)
-            break
+            raise NotionAPIError(
+                f"Failed to query Notion database {database_id}"
+            ) from err
 
+        data = response.json()
         all_results.extend(data.get("results", []))
         has_more = data.get("has_more", False)
         start_cursor = data.get("next_cursor")
 
     return all_results
+
+
+def _reader_item_exists(title: str, link: str) -> bool:
+    """Check if a Reader record already exists by Link, or by Title when link is empty."""
+    if link:
+        query_payload = {
+            "page_size": 1,
+            "filter": {"property": "Link", "url": {"equals": link}},
+        }
+    else:
+        query_payload = {
+            "page_size": 1,
+            "filter": {"property": "Title", "title": {"equals": title}},
+        }
+
+    results = _query_database_with_pagination(NOTION_READER_DATABASE_ID, query_payload)
+    return bool(results)
 
 
 def get_feed_urls_from_notion() -> list[dict]:
@@ -88,7 +135,9 @@ def get_existing_items_since(days: int = 5) -> tuple[set[str], set[str]]:
     Returns:
         A tuple of (titles_set, links_set) for fast membership checks.
     """
-    since_date = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+    since_date = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        days=days
+    )
 
     payload = {
         "filter": {
@@ -119,6 +168,9 @@ def add_feed_item_to_notion(notion_item: dict) -> bool:
 
     Handles Notion's 100-block-per-request limit by creating the page with
     the first chunk and appending remaining chunks via the blocks API.
+
+    Creation timeout follows a confirm-before-retry strategy:
+    query Reader by Link/Title first to avoid duplicate pages.
     """
     title = notion_item.get("title", "")
     link = notion_item.get("link", "")
@@ -126,7 +178,7 @@ def add_feed_item_to_notion(notion_item: dict) -> bool:
 
     first_chunk = content[:_MAX_BLOCKS_PER_REQUEST]
     remaining_chunks = [
-        content[i:i + _MAX_BLOCKS_PER_REQUEST]
+        content[i : i + _MAX_BLOCKS_PER_REQUEST]
         for i in range(_MAX_BLOCKS_PER_REQUEST, len(content), _MAX_BLOCKS_PER_REQUEST)
     ]
 
@@ -139,36 +191,77 @@ def add_feed_item_to_notion(notion_item: dict) -> bool:
         "children": first_chunk,
     }
 
-    try:
-        response = requests.post(
-            f"{NOTION_BASE_URL}/pages",
-            headers=_get_headers(),
-            json=payload,
-            timeout=_REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-        page_id = response.json().get("id")
-    except requests.exceptions.RequestException as err:
-        logger.error("Error adding feed item to Notion: %s", err)
+    page_id = ""
+    for attempt in range(1, _CREATE_PAGE_MAX_ATTEMPTS + 1):
+        try:
+            response = _notion_request(
+                "POST",
+                "/pages",
+                json=payload,
+                max_retries=0,
+                operation_name=f"create notion page for {title[:60]}",
+            )
+            page_id = response.json().get("id", "")
+            break
+        except requests.exceptions.Timeout as err:
+            logger.warning(
+                "Timeout creating Notion page for '%s' (attempt %d/%d): %s",
+                title,
+                attempt,
+                _CREATE_PAGE_MAX_ATTEMPTS,
+                err,
+            )
+            try:
+                if _reader_item_exists(title=title, link=link):
+                    logger.info(
+                        "Notion page already exists after timeout, treat as success: %s",
+                        title,
+                    )
+                    return True
+            except NotionAPIError as lookup_err:
+                logger.error(
+                    "Failed to confirm page existence after timeout for '%s': %s",
+                    title,
+                    lookup_err,
+                )
+                return False
+
+            if attempt == _CREATE_PAGE_MAX_ATTEMPTS:
+                logger.error(
+                    "Create page failed after %d attempts (timeout): %s",
+                    _CREATE_PAGE_MAX_ATTEMPTS,
+                    title,
+                )
+                return False
+        except requests.exceptions.RequestException as err:
+            logger.error("Error creating Notion page for '%s': %s", title, err)
+            return False
+
+    if not page_id:
+        logger.error("Missing page id after creating Notion page for '%s'", title)
         return False
 
     for chunk in remaining_chunks:
         try:
-            requests.patch(
-                f"{NOTION_BASE_URL}/blocks/{page_id}/children",
-                headers=_get_headers(),
+            _notion_request(
+                "PATCH",
+                f"/blocks/{page_id}/children",
                 json={"children": chunk},
-                timeout=_REQUEST_TIMEOUT,
+                max_retries=0,
+                operation_name=f"append blocks to notion page {page_id}",
             )
         except requests.exceptions.RequestException as err:
             logger.error("Error appending blocks to page %s: %s", page_id, err)
+            return False
 
     return True
 
 
 def delete_old_unread_feed_items_from_notion() -> None:
     """Archive feed items older than configured days that are still unread."""
-    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=_ARCHIVE_AFTER_DAYS)
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        days=_ARCHIVE_AFTER_DAYS
+    )
 
     payload = {
         "filter": {
@@ -191,15 +284,16 @@ def delete_old_unread_feed_items_from_notion() -> None:
     for item in results:
         page_id = item.get("id")
         try:
-            requests.patch(
-                f"{NOTION_BASE_URL}/pages/{page_id}",
-                headers=_get_headers(),
+            _notion_request(
+                "PATCH",
+                f"/pages/{page_id}",
                 json={"archived": True},
-                timeout=_REQUEST_TIMEOUT,
+                max_retries=_SAFE_REQUEST_RETRIES,
+                operation_name=f"archive notion page {page_id}",
             )
             archived += 1
         except requests.exceptions.RequestException as err:
-            logger.error("Error archiving page %s: %s", page_id, err)
+            raise NotionAPIError(f"Failed to archive Notion page {page_id}") from err
 
     if archived:
         logger.info("Archived %d old unread items", archived)

@@ -34,9 +34,6 @@ def main():
 
     logger.info("Notion write complete: %d success, %d failed", success, failed)
 
-    if failed:
-        raise RuntimeError(f"Notion write failed for {failed} item(s)")
-
     delete_old_unread_feed_items_from_notion()
 
 

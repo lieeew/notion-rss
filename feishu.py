@@ -4,7 +4,11 @@ from datetime import datetime
 
 import requests
 
+from network import request_with_retries
+
 logger = logging.getLogger(__name__)
+_FEISHU_TIMEOUT = 15
+_FEISHU_RETRIES = 1
 
 
 def send_to_feishu(date: str, text: str) -> bool:
@@ -25,19 +29,22 @@ def send_to_feishu(date: str, text: str) -> bool:
 
     payload = {
         "msg_type": "text",
-        "content": {
-            "date": date,
-            "text": text
-        }
+        "content": {"date": date, "text": text},
     }
 
     try:
-        response = requests.post(webhook_url, json=payload, timeout=30)
-        response.raise_for_status()
+        request_with_retries(
+            "POST",
+            webhook_url,
+            json=payload,
+            timeout=_FEISHU_TIMEOUT,
+            max_retries=_FEISHU_RETRIES,
+            operation_name="send feishu webhook",
+        )
         logger.info("Feishu message sent successfully at %s", datetime.now().isoformat())
         return True
-    except requests.exceptions.RequestException as e:
-        logger.error("Failed to send Feishu message: %s", e)
+    except requests.exceptions.RequestException as err:
+        logger.error("Failed to send Feishu message: %s", err)
         return False
 
 

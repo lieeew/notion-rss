@@ -65,6 +65,12 @@ def markdown_to_notion_blocks(markdown_content: str) -> list[dict]:
             blocks.append(_make_block("paragraph", _make_rich_text(line[1:-1], code=True)))
         elif line.startswith("http://") or line.startswith("https://"):
             blocks.append(_make_block("paragraph", _make_rich_text(line, link=line)))
+        elif line.startswith("Comments URL: <") and line.endswith(">"):
+            # Convert 'Comments URL: <https://example>' to Notion hyperlinked text
+            label, link = line.split("<")
+            label = label.replace(":", "").strip()
+            link = link[:-1].strip()
+            blocks.append(_make_block("paragraph", _make_rich_text(f"{label}: {link}", link=link)))
         else:
             link_match = _LINK_RE.match(line)
             if link_match:

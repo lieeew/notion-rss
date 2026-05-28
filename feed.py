@@ -4,15 +4,19 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import feedparser
+import requests
 from dotenv import load_dotenv
 
-from notion import get_feed_urls_from_notion, get_existing_items_since
+from network import request_with_retries
+from notion import get_existing_items_since, get_feed_urls_from_notion
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 RUN_FREQUENCY = int(os.getenv("RUN_FREQUENCY", "86400"))
 _MAX_FETCH_WORKERS = 5
+_RSS_TIMEOUT = 20
+_RSS_RETRIES = 2
 
 
 def _parse_struct_time_to_timestamp(st) -> float:
@@ -37,9 +41,21 @@ def _get_new_feed_items_from(
 ) -> list[dict]:
     """Fetch and filter new items from a single RSS feed."""
     try:
-        rss = feedparser.parse(feed_url)
-    except Exception as e:
-        logger.error("Error parsing feed %s: %s", feed_url, e)
+        response = request_with_retries(
+            "GET",
+            feed_url,
+            timeout=_RSS_TIMEOUT,
+            max_retries=_RSS_RETRIES,
+            operation_name=f"fetch rss {feed_url}",
+        )
+    except requests.exceptions.RequestException as err:
+        logger.warning("Failed to fetch feed %s: %s", feed_url, err)
+        return []
+
+    try:
+        rss = feedparser.parse(response.content)
+    except Exception as err:
+        logger.error("Error parsing feed %s: %s", feed_url, err)
         return []
 
     current_time_struct = rss.get("updated_parsed") or rss.get("published_parsed")
@@ -65,12 +81,14 @@ def _get_new_feed_items_from(
         if title in existing_titles or link in existing_links:
             continue
 
-        new_items.append({
-            "title": title,
-            "link": link,
-            "content": _extract_content(item),
-            "published_parsed": pub_date,
-        })
+        new_items.append(
+            {
+                "title": title,
+                "link": link,
+                "content": _extract_content(item),
+                "published_parsed": pub_date,
+            }
+        )
 
     return new_items
 
@@ -93,8 +111,8 @@ def get_new_feed_items() -> list[dict]:
         for future in as_completed(futures):
             try:
                 all_new_feed_items.extend(future.result())
-            except Exception as e:
-                logger.error("Error fetching feed %s: %s", futures[future], e)
+            except Exception as err:
+                logger.error("Error fetching feed %s: %s", futures[future], err)
 
     all_new_feed_items.sort(
         key=lambda x: _parse_struct_time_to_timestamp(x.get("published_parsed"))

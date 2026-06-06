@@ -11,6 +11,8 @@
 
 Automatically fetch RSS feeds, store articles in Notion databases, and push daily summaries to Feishu groups.
 
+[中文说明](README.zh.md)
+
 </div>
 
 ---

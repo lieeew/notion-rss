@@ -5,7 +5,7 @@ import os
 import requests
 from dotenv import load_dotenv
 
-from network import request_with_retries
+from network import describe_http_error, request_with_retries
 
 load_dotenv()
 
@@ -163,6 +163,33 @@ def get_existing_items_since(days: int = 5) -> tuple[set[str], set[str]]:
     return titles, links
 
 
+def _is_bad_request(err: requests.exceptions.RequestException) -> bool:
+    response = getattr(err, "response", None)
+    return response is not None and response.status_code == 400
+
+
+def _create_page_without_content(payload: dict, title: str) -> bool:
+    """Create the page with properties only, used when its content is rejected."""
+    try:
+        _notion_request(
+            "POST",
+            "/pages",
+            json={**payload, "children": []},
+            max_retries=0,
+            operation_name=f"create notion page without content for {title[:60]}",
+        )
+    except requests.exceptions.RequestException as err:
+        logger.error(
+            "Error creating Notion page without content for '%s': %s",
+            title,
+            describe_http_error(err),
+        )
+        return False
+
+    logger.warning("Created Notion page without content for '%s'", title)
+    return True
+
+
 def add_feed_item_to_notion(notion_item: dict) -> bool:
     """Add a new feed item to the Reader database in Notion.
 
@@ -234,7 +261,11 @@ def add_feed_item_to_notion(notion_item: dict) -> bool:
                 )
                 return False
         except requests.exceptions.RequestException as err:
-            logger.error("Error creating Notion page for '%s': %s", title, err)
+            logger.error(
+                "Error creating Notion page for '%s': %s", title, describe_http_error(err)
+            )
+            if _is_bad_request(err) and payload["children"]:
+                return _create_page_without_content(payload, title)
             return False
 
     if not page_id:

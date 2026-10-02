@@ -3,10 +3,25 @@ import time
 from email.utils import parsedate_to_datetime
 
 import requests
+from urllib3.exceptions import NameResolutionError
 
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+_ERROR_BODY_MAX_LENGTH = 500
+
+
+def describe_http_error(err: requests.exceptions.RequestException) -> str:
+    """Return the error message, with the response body appended when available."""
+    response = getattr(err, "response", None)
+    if response is None or not response.text:
+        return str(err)
+    return f"{err} - {response.text[:_ERROR_BODY_MAX_LENGTH]}"
+
+
+def _is_name_resolution_error(err: requests.exceptions.ConnectionError) -> bool:
+    reason = getattr(err.args[0], "reason", None) if err.args else None
+    return isinstance(reason, NameResolutionError)
 
 
 def _retry_after_seconds(header_value: str | None) -> float | None:
@@ -52,7 +67,10 @@ def request_with_retries(
         try:
             response = requests.request(method_upper, url, timeout=timeout, **kwargs)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as err:
-            if attempt == max_attempts:
+            if attempt == max_attempts or (
+                isinstance(err, requests.exceptions.ConnectionError)
+                and _is_name_resolution_error(err)
+            ):
                 raise
             delay = _backoff_seconds(attempt, base_delay)
             logger.warning(

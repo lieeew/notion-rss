@@ -17,6 +17,16 @@ RUN_FREQUENCY = int(os.getenv("RUN_FREQUENCY", "86400"))
 _MAX_FETCH_WORKERS = 5
 _RSS_TIMEOUT = 20
 _RSS_RETRIES = 2
+_RSS_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": (
+        "application/rss+xml, application/atom+xml, application/xml;q=0.9, "
+        "text/xml;q=0.8, */*;q=0.5"
+    ),
+}
 
 
 def _parse_struct_time_to_timestamp(st) -> float:
@@ -46,6 +56,7 @@ def _get_new_feed_items_from(
             feed_url,
             timeout=_RSS_TIMEOUT,
             max_retries=_RSS_RETRIES,
+            headers=_RSS_HEADERS,
             operation_name=f"fetch rss {feed_url}",
         )
     except requests.exceptions.RequestException as err:
